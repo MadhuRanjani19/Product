@@ -1,0 +1,1053 @@
+#include "DHT.h"
+#include "RTClib.h"
+#include <esp_task_wdt.h>
+#include <BluetoothSerial.h>
+#include <Preferences.h>
+#define DHTPIN 32 // Digital pin connected to the DHT sensor
+#define DHTTYPE DHT22 // DHT 22 (AM2302), AM2321
+#define NUM_LEDS 120
+#define LAMP1 18
+#define LAMP2 19
+#define MAX_ADDRESS_COUNT 12 // Monitored addresses
+#define BYTES_PER_ENTRY 3 // Each entry = 2 bytes (address) + 1 byte (value)
+#define PULSE_PIN 33 // Pin sending the pulse
+uint16_t monitoredAddresses[MAX_ADDRESS_COUNT] = {
+0x200F, 0x2011, 0x2013, 0x2015, 0x2017,
+0x2019, 0x201B, 0x201D, 0x201F, 0x2021,
+0x2023, 0x2025
+};
+// State Machine States
+enum HMIState {
+STATE_READ,
+STATE_WRITE
+};
+HMIState currentState = STATE_READ; // Initial state
+unsigned long lastStateChange = 0; // Timer for state change
+const unsigned long STATE_INTERVAL = 100; // Time interval for state change (in ms)
+unsigned long previousMilliss = 0;
+const unsigned long interval = 100;
+bool updateTemp = true;
+bool buttonPressed = false; // Flag to track button presses
+uint8_t HMIdata[50]; // Main buffer for incoming HMI data
+uint8_t buffer9[9]; // Buffer for 9-byte frames
+uint8_t buffer11[11]; // Buffer for 11-byte frames
+int bytes_read = 0; // Number of bytes read
+uint32_t ID = 0; // Store ID (4-byte value from 0x2000)
+uint32_t passcode = 0; // Store passcode (4-byte value from 0x2005)
+uint32_t ID_1 = 123456; // Store ID (4-byte value from 0x2000)
+uint32_t passcode_1 = 123456; // Store passcode (4-byte value from 0x2005)
+int adcValue;
+int co2ppm;
+int Blue=0;
+int LAMP=0;
+unsigned long lastSensorRead = 0;
+const long readInterval = 1000; // 1 second
+float HUMD,TEMP;//RTC type declartion
+char currentPattern = '0'; // Store current pattern
+unsigned long previousMillis = 0;
+int rainbowOffset = 0;
+int mode = 0;
+//RTC variables
+char daysOfTheWeek[7][12] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+int hour;
+unsigned int Pres = 0;
+unsigned int RTCdelay = 1000;
+String ampm ;
+String Date;
+String Time;
+String Dayofweek;
+String Temp;
+String humd;
+String CO2;
+String ON = "O ";
+String OFF = "F ";
+String OPEN = "OPEN";
+String CLOSE = "CLOSE";
+String TASK1, TASK2, TASK3, TASK4, TASK5, TASK6;
+String TASK1_1, TASK2_1, TASK3_1, TASK4_1, TASK5_1, TASK6_1;
+String OPEN_1 ,CLOSE_1;
+String Empty20 =" ";
+String Empty100 =" ";
+RTC_DS3231 rtc;
+DHT dht(DHTPIN, DHTTYPE);//DHT22 Init
+HardwareSerial HMISerial(2); // Use Serial2 for hardware serial
+HardwareSerial HMISerial1(1); // Use Serial2 for hardware serial
+BluetoothSerial SerialBT;
+Preferences preferences;
+// Task Handles
+TaskHandle_t task1Handle = NULL;
+TaskHandle_t task2Handle = NULL;
+//RTC Time and Date Retrival
+void RTC() {
+DateTime now = rtc.now();
+// Convert to 12-hour format
+hour = now.hour();
+ampm = "AM";
+if (hour >= 12) {
+ampm = "PM";
+if (hour > 12) hour -= 12; // Convert to 12-hour format
+} else if (hour == 0) {
+hour = 12; // Midnight is 12:00 AM
+}
+Date = String(now.month()) + "/" + String(now.day()) + "/" + String(now.year())+" " ;
+Time = String(hour) + ":" + String(now.minute()) + ":" + String(now.second()) + " " + " " ;
+Dayofweek = String(daysOfTheWeek[now.dayOfTheWeek()]) + " " ;
+// Print timestamp
+Serial.print(Date);
+Serial.print(" ");
+Serial.print(Time);
+Serial.print(" ");
+Serial.println(Dayofweek);
+}
+void Co2_data()
+{
+// Simulating CO2 levels in poor ventilation (1000 - 2000 ppm)
+int minCO2 = 1000; // Minimum CO2 level in poor ventilation
+int maxCO2 = 2000; // Maximum CO2 level in poor ventilation
+co2ppm = random(minCO2, maxCO2 + 1); // Generate a random CO2 value in range
+CO2 = String(co2ppm) + " PPM"+" ";
+Serial.print(" CO2 Concentration : ");
+Serial.print(co2ppm);
+Serial.println(" PPM");
+}
+//DHT22 Sensor data
+void Dht22() {
+// Reading temperature or humidity takes about 250 milliseconds!
+HUMD = dht.readHumidity();
+TEMP = dht.readTemperature();
+// Check if any reads failed and exit early (to try again).
+if (isnan( HUMD) || isnan(TEMP)) {
+    Serial.println(F("Failed to read from DHT sensor!"));
+    return;
+}
+
+
+
+
+Serial.print(F("Humidity: "));
+Serial.print(HUMD);
+Serial.print(F("%  Temperature: "));
+Serial.print(TEMP);
+Serial.println(F("°C"));
+}
+void clear_buffer() {
+for (int i = 0; i < 50; i++) {
+HMIdata[i] = 0;
+}
+bytes_read = 0; // Reset bytes_read after clearing the buffer
+}
+void HMI_PAGE_RESP() {
+int bytes_read = 0;
+uint16_t address = 0;
+int32_t value = 0; // Signed 32-bit integer
+while (HMISerial.available() > 0) {
+    
+    HMIdata[bytes_read] = HMISerial.read();  // Read one byte
+    Serial.print(HMIdata[bytes_read], HEX);
+    Serial.print(" ");
+    bytes_read++;
+
+    // // Ensure valid frame start
+    // if (bytes_read >= 2 && (HMIdata[0] != 0x5A || HMIdata[1] != 0xA5)) {
+    //     Serial.println("\nInvalid frame start, resetting buffer.");
+    //     bytes_read = 0;
+    //    return;
+    // }
+
+                    // Check if a full frame is received
+    if ((bytes_read == 9 && HMIdata[2] == 0x06) || (bytes_read == 11 && HMIdata[2] == 0x08)) {
+        // Transfer data to the appropriate buffer
+        if (bytes_read == 9) {
+            memcpy(buffer9, HMIdata, 9); // Copy 9 bytes to buffer9
+            processFrame(buffer9, 9);   // Process 9-byte frame
+        } else if (bytes_read == 11) {
+            memcpy(buffer11, HMIdata, 11); // Copy 11 bytes to buffer11
+            processFrame(buffer11, 11);    // Process 11-byte frame
+        }
+
+        // Reset buffer after processing
+
+        clear_buffer();
+        return;
+    }
+    // if (bytes_read >= 12)
+    // {
+    //   Serial.println("Memory overflow reseting the buffer");
+    //    bytes_read = 0;
+    // }
+      
+ 
+}
+}
+void processFrame(uint8_t* buffer, int length) {
+uint16_t address = 0;
+int32_t value = 0; // Signed 32-bit integer
+String data ;
+// Extract address (2 bytes)
+address = (buffer[4] << 8) | buffer[5];
+// Extract value (4 bytes, little-endian)
+if (length == 9) {
+    value = (buffer[8] << 24) | (buffer[7] << 16) | (buffer[6] << 8) | buffer[5];
+
+     clear_buffer();
+} else if (length == 11) {
+    
+    value = (buffer[7] << 24) | (buffer[8] << 16) | (buffer[9] << 8) | buffer[10];
+     clear_buffer();
+}
+
+// *Convert to signed 32-bit (handle 2’s complement)*
+if (value & 0x80000000) {  // If MSB is set, it's negative
+    value = -(int32_t)((~value + 1) & 0xFFFFFFFF);
+}
+
+
+// Print address and value
+Serial.println("\n--- Valid Frame Received ---");
+Serial.print("ADDRESS: 0x");
+Serial.print(address, HEX);
+Serial.print("\nVALUE: ");
+Serial.println(value, DEC);
+
+// Process based on address
+if (address == 0x2000) {
+    ID = value;
+    Serial.print("\nID: ");
+    Serial.println(ID, DEC);
+      clear_buffer();
+} else if (address == 0x2005) {
+    passcode = value;
+    Serial.print("\nPasscode: ");
+    Serial.println(passcode, DEC);
+     clear_buffer();
+} else if (address == 0x4000) {
+    if (ID == ID_1 && passcode == passcode_1) {
+        pages(1);
+        clear_buffer();
+    }
+} else if (address == 0x4280 ) 
+{
+ 
+  Blue++;
+   if(Blue == 1)
+   {
+    
+     SerialBT.begin("SMART_DESK"); // Bluetooth name
+     Serial.println("Bluetooth Started! Waiting for tasks...");
+     HMI_writeBLU("  1");
+   }
+   else if(Blue > 1)
+   {
+    SerialBT.end();
+     HMI_writeBLU("  0");
+      Serial.println("Bluetooth Ended!...");
+     Blue=0;
+   }
+      clear_buffer();
+} else if (address == 0x4290 ) {
+      LAMP++;
+      if(LAMP ==1)
+      {
+        digitalWrite(LAMP1,LOW);
+      } 
+      else if(LAMP ==2)
+      {
+        digitalWrite(LAMP1,HIGH);
+        digitalWrite(LAMP2,LOW);
+      } 
+      else if(LAMP ==3)
+      {
+       digitalWrite(LAMP1,LOW);
+       digitalWrite(LAMP2,LOW);
+      }
+      else if(LAMP>3)
+      {
+       digitalWrite(LAMP1,HIGH);
+       digitalWrite(LAMP2,HIGH);
+       LAMP=0;
+      }
+     
+     
+     clear_buffer();
+} else if (address == 0x4300 ) {
+    sendPulse(10); 
+ 
+      clear_buffer();
+
+}
+ else if (address == 0x4020 ) {
+
+      clear_buffer();
+}
+else if(address == 0x4220)
+{
+ HMI_writeStat1(CLOSE);
+  clear_buffer();
+}
+ else if(address == 0x4230)
+{
+ HMI_writeStat2(CLOSE);
+  clear_buffer();
+}
+  else if(address == 0x4240)
+{
+ HMI_writeStat3(CLOSE);
+  clear_buffer();
+}
+  else if(address == 0x4250)
+{
+ HMI_writeStat4(CLOSE);
+  clear_buffer();
+}
+  else if(address == 0x4260)
+{
+ HMI_writeStat5(CLOSE);
+  clear_buffer();
+}
+  else if(address == 0x4270)
+{
+ HMI_writeStat6(CLOSE);
+  clear_buffer();
+}
+  else if(address == 0x4210)
+{
+ HMI_clear();
+  clear_buffer();
+}
+}
+void HMI_update() {
+static uint8_t step = 0;
+unsigned long currentMillis = millis();
+if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    switch (step) {
+        case 0:
+          HMI_writeTemp(Temp);
+            break;
+        case 1: 
+        HMI_writeHumd(humd);
+            break;
+        case 2:
+   HMI_writeCo2(CO2);
+            break;
+        case 3:
+   HMI_writeTime(Time);
+            break;
+        case 4:
+HMI_writeDate(Date);
+            break;
+        case 5:
+   HMI_writeDay(Dayofweek);
+            break;
+        default:
+            step = 0;
+            return;
+    }
+    step++;
+}
+      
+}
+void HMI_Startupdate() {
+static unsigned long previousMillis1 = 0;
+static unsigned long previousMillis2 = 0;
+static unsigned long previousMillis3 = 0;
+static unsigned long previousMillis4 = 0;
+static unsigned long previousMillis5 = 0;
+static unsigned long previousMillis6 = 0;
+static unsigned long previousMillisTask1 = 0;
+static unsigned long previousMillisTask2 = 0;
+static unsigned long previousMillisTask3 = 0;
+static unsigned long previousMillisTask4 = 0;
+static unsigned long previousMillisTask5 = 0;
+static unsigned long previousMillisTask6 = 0;
+static bool stat1Done = false;
+static bool stat2Done = false;
+static bool stat3Done = false;
+static bool stat4Done = false;
+static bool stat5Done = false;
+static bool stat6Done = false;
+static bool task1Done = false;
+static bool task2Done = false;
+static bool task3Done = false;
+static bool task4Done = false;
+static bool task5Done = false;
+static bool task6Done = false;
+unsigned long currentMillis = millis();
+// Stat1
+if (!stat1Done && currentMillis - previousMillis1 >= 50) {
+HMI_writeStat1( OPEN_1);
+previousMillis1 = currentMillis;
+stat1Done = true;
+}
+// Stat2
+if (stat1Done && !stat2Done && currentMillis - previousMillis2 >= 50) {
+HMI_writeStat2( OPEN_1);
+previousMillis2 = currentMillis;
+stat2Done = true;
+}
+// Stat3
+if (stat2Done && !stat3Done && currentMillis - previousMillis3 >= 50) {
+HMI_writeStat3( OPEN_1);
+previousMillis3 = currentMillis;
+stat3Done = true;
+}
+// Stat4
+if (stat3Done && !stat4Done && currentMillis - previousMillis4 >= 50) {
+HMI_writeStat4( OPEN_1);
+previousMillis4 = currentMillis;
+stat4Done = true;
+}
+// Stat5
+if (stat4Done && !stat5Done && currentMillis - previousMillis5 >= 50) {
+HMI_writeStat5( OPEN_1);
+previousMillis5 = currentMillis;
+stat5Done = true;
+}
+// Stat6
+if (stat5Done && !stat6Done && currentMillis - previousMillis6 >= 50) {
+HMI_writeStat6( OPEN_1);
+previousMillis6 = currentMillis;
+stat6Done = true;
+}
+// Task1
+if (stat6Done && !task1Done && currentMillis - previousMillisTask1 >= 50) {
+HMI_writeTask1( TASK1_1 );
+previousMillisTask1 = currentMillis;
+task1Done = true;
+}
+// Task2
+if (task1Done && !task2Done && currentMillis - previousMillisTask2 >= 50) {
+HMI_writeTask2( TASK2_1 );
+previousMillisTask2 = currentMillis;
+task2Done = true;
+}
+// Task3
+if (task2Done && !task3Done && currentMillis - previousMillisTask3 >= 50) {
+HMI_writeTask3( TASK3_1 );
+previousMillisTask3 = currentMillis;
+task3Done = true;
+}
+// Task4
+if (task3Done && !task4Done && currentMillis - previousMillisTask4 >= 50) {
+HMI_writeTask4( TASK4_1 );
+previousMillisTask4 = currentMillis;
+task4Done = true;
+}
+// Task5
+if (task4Done && !task5Done && currentMillis - previousMillisTask5 >= 50) {
+HMI_writeTask5( TASK5_1 );
+previousMillisTask5 = currentMillis;
+task5Done = true;
+}
+// Task6
+if (task5Done && !task6Done && currentMillis - previousMillisTask6 >= 50) {
+HMI_writeTask6( TASK6_1 );
+previousMillisTask6 = currentMillis;
+task6Done = true;
+}
+}
+void Read_data()
+{
+unsigned long currentMillis = millis();
+// Check if 1 second has passed
+if (currentMillis - lastSensorRead >= readInterval) {
+lastSensorRead = currentMillis;
+RTC();
+Co2_data();
+Dht22();
+// Read RTC, CO2, and DHT values here
+Serial.println("Reading sensors...");
+}
+}
+void HMI_writeStat1(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x29);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x50);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeStat2(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x27);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x73);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+
+HMISerial1.flush();
+}
+void HMI_writeStat3(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x27);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x94);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeStat4(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x28);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x15);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeStat5(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x28);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x36);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeStat6(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x28);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x57);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeBLU(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x29);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x25);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeTask1(String str) {
+// Calculate the total length of the data packet
+uint8_t length = 3 + 80; // 3 bytes (command + address) + 100 bytes (string)
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x22);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x26);  // Low byte of Address (0x2011)
+char formattedStr[101]; // 100 characters + null terminator
+// Format the string with left-alignment and space padding
+snprintf(formattedStr, sizeof(formattedStr), "%-100s", str.c_str());
+
+// Send the formatted string (always 100 chars)
+for (uint8_t i = 0; i < 100; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeTask2(String str) {
+// Calculate the total length of the data packet
+uint8_t length = 3 + 80; // 3 bytes (command + address) + 100 bytes (string)
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x23);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x27);  // Low byte of Address (0x2011)
+
+char formattedStr[101]; // 100 characters + null terminator
+
+// Format the string with left-alignment and space padding
+snprintf(formattedStr, sizeof(formattedStr), "%-100s", str.c_str());
+
+
+// Send the formatted string (always 100 chars)
+for (uint8_t i = 0; i < 100; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeTask3(String str) {
+// Calculate the total length of the data packet
+uint8_t length = 3 + 80; // 3 bytes (command + address) + 100 bytes (string)
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x24);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x28);  // Low byte of Address (0x2011)
+char formattedStr[101]; // 100 characters + null terminator
+// Format the string with left-alignment and space padding
+snprintf(formattedStr, sizeof(formattedStr), "%-100s", str.c_str());
+
+// Send the formatted string (always 100 chars)
+for (uint8_t i = 0; i < 100; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+
+HMISerial1.flush();
+}
+void HMI_writeTask4(String str) {
+// Calculate the total length of the data packet
+uint8_t length = 3 + 80; // 3 bytes (command + address) + 100 bytes (string)
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x25);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x29);  // Low byte of Address (0x2011)
+char formattedStr[101]; // 100 characters + null terminator
+// Format the string with left-alignment and space padding
+snprintf(formattedStr, sizeof(formattedStr), "%-100s", str.c_str());
+
+
+// Send the formatted string (always 100 chars)
+for (uint8_t i = 0; i < 100; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+
+HMISerial1.flush();
+}
+void HMI_writeTask5(String str) {
+// Calculate the total length of the data packet
+uint8_t length = 3 + 80; // 3 bytes (command + address) + 100 bytes (string)
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x26);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x30);  // Low byte of Address (0x2011)
+
+char formattedStr[101]; // 100 characters + null terminator
+
+// Format the string with left-alignment and space padding
+snprintf(formattedStr, sizeof(formattedStr), "%-100s", str.c_str());
+
+// Send the formatted string (always 100 chars)
+for (uint8_t i = 0; i < 100; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+
+HMISerial1.flush();
+}
+void HMI_writeTask6(String str) {
+// Calculate the total length of the data packet
+uint8_t length = 3 + 80; // 3 bytes (command + address) + 100 bytes (string)
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x27);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x31);  // Low byte of Address (0x2011)
+char formattedStr[101]; // 100 characters + null terminator
+
+// Format the string with left-alignment and space padding
+snprintf(formattedStr, sizeof(formattedStr), "%-100s", str.c_str());
+
+// Send the formatted string (always 100 chars)
+for (uint8_t i = 0; i < 100; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+
+HMISerial1.flush();
+}
+void HMI_writeTemp(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x20);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x11);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeHumd(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x20);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x40);  // Low byte of Address (0x2011)
+
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeCo2(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x20);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x61);  // Low byte of Address (0x2011)
+
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeTime(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x20);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x82);  // Low byte of Address (0x2011)
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+
+HMISerial1.flush();
+}
+void HMI_writeDate(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x21);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x04);  // Low byte of Address (0x2011)
+
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_writeDay(String str) {
+uint8_t length = str.length() + 3; // 1 (Command) + 2 (Address) + String Length
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5); // Start byte
+HMISerial1.write(length);         // Length of the data after this byte
+HMISerial1.write((uint8_t)0x82);  // Command (Write String)
+HMISerial1.write((uint8_t)0x29);  // High byte of Address (0x2011)
+HMISerial1.write((uint8_t)0x00);  // Low byte of Address (0x2011)
+
+// Format the string to be exactly 20 characters (left-aligned, space-padded)
+char formattedStr[21]; // 20 chars + null terminator
+sprintf(formattedStr, "%-20s", str.c_str());
+
+// Send the formatted string (always 20 chars)
+for (uint8_t i = 0; i < 20; i++) {
+    HMISerial1.write((uint8_t)formattedStr[i]);
+}
+HMISerial1.flush();
+}
+void HMI_clear() {
+// Reset stored tasks in Preferences
+preferences.putString("task1", "No Task 1");
+preferences.putString("task2", "No Task 2");
+preferences.putString("task3", "No Task 3");
+preferences.putString("task4", "No Task 4");
+preferences.putString("task5", "No Task 5");
+preferences.putString("task6", "No Task 6");
+ESP.restart();
+}
+// Send page change command
+void pages(int pg) {
+HMISerial1.write((uint8_t)0x5A); // Start byte
+HMISerial1.write((uint8_t)0xA5);
+HMISerial1.write((uint8_t)0x07); // Length
+HMISerial1.write((uint8_t)0x82); // Command
+HMISerial1.write((uint8_t)0x00);
+HMISerial1.write((uint8_t)0x84);
+HMISerial1.write((uint8_t)0x5A);
+HMISerial1.write((uint8_t)0x01);
+HMISerial1.write((uint8_t)((pg >> 8) & 0xFF)); // High byte of page
+HMISerial1.write((uint8_t)(pg & 0xFF)); // Low byte of page
+HMISerial1.flush();
+}
+// Function to send a pulse with a specified duration (in milliseconds)
+void sendPulse(unsigned long pulseDuration) {
+unsigned long startTime = millis(); // Store the start time
+digitalWrite(PULSE_PIN,LOW); // Start the pulse
+Serial.println("Pulse started on GPIO 33");
+// Keep the pulse HIGH for the specified duration without blocking other code
+while (millis() - startTime < pulseDuration) {
+// Non-blocking wait
+}
+digitalWrite(PULSE_PIN, HIGH); // End the pulse
+Serial.println("Pulse ended on GPIO 33");
+}
+// Function to receive and process Bluetooth data
+void receiveBluetoothData() {
+static String incomingData = "";
+if (SerialBT.available()) {
+char receivedChar = SerialBT.read();
+incomingData += receivedChar;
+// Check for end of message
+if (receivedChar == '\n') {
+  incomingData.trim(); // Remove any extra spaces or newlines
+
+  // Check if message starts with a number followed by *
+  if (incomingData.indexOf('*') > 0) {
+    int taskNumber = incomingData.substring(0, incomingData.indexOf('*')).toInt();
+    String taskContent = incomingData.substring(incomingData.indexOf('*') + 1);
+
+    if (taskContent.length() > 100) {
+      SerialBT.println("Error: Task content exceeds 100 characters.");
+      Serial.println("Error: Task content exceeds 100 characters.");
+    } else {
+      switch (taskNumber) {
+        case 1:
+          TASK1 = taskContent;
+          preferences.putString("task1", TASK1);
+          Serial.println("Task 1 Updated: " + TASK1);
+          SerialBT.println("Task 1 Saved: " + TASK1);  // Echo back to phone
+          break;
+        case 2:
+          TASK2 = taskContent;
+          preferences.putString("task2", TASK2);
+          Serial.println("Task 2 Updated: " + TASK2);
+          SerialBT.println("Task 2 Saved: " + TASK2);  // Echo back to phone
+          break;
+        case 3:
+          TASK3 = taskContent;
+          preferences.putString("task3", TASK3);
+          Serial.println("Task 3 Updated: " + TASK3);
+          SerialBT.println("Task 3 Saved: " + TASK3);  // Echo back to phone
+          break;
+        case 4:
+          TASK4 = taskContent;
+          preferences.putString("task4", TASK4);
+          Serial.println("Task 4 Updated: " + TASK4);
+          SerialBT.println("Task 4 Saved: " + TASK4);  // Echo back to phone
+          break;
+        case 5:
+          TASK5 = taskContent;
+          preferences.putString("task5", TASK5);
+          Serial.println("Task 5 Updated: " + TASK5);
+          SerialBT.println("Task 5 Saved: " + TASK5);  // Echo back to phone
+          break;
+        case 6:
+          TASK6 = taskContent;
+          preferences.putString("task6", TASK6);
+          Serial.println("Task 6 Updated: " + TASK6);
+          SerialBT.println("Task 6 Saved: " + TASK6);  // Echo back to phone
+          break;
+        case 7: // Show all stored tasks
+          Serial.println("Displaying All Stored Tasks:");
+          SerialBT.println("All Stored Tasks:");
+          Serial.println("TASK1: " + TASK1);
+          SerialBT.println("TASK1: " + TASK1);
+          Serial.println("TASK2: " + TASK2);
+          SerialBT.println("TASK2: " + TASK2);
+          Serial.println("TASK3: " + TASK3);
+          SerialBT.println("TASK3: " + TASK3);
+          Serial.println("TASK4: " + TASK4);
+          SerialBT.println("TASK4: " + TASK4);
+          Serial.println("TASK5: " + TASK5);
+          SerialBT.println("TASK5: " + TASK5);
+          Serial.println("TASK6: " + TASK6);
+          SerialBT.println("TASK6: " + TASK6);
+          break;
+        case 8: // Restart ESP32
+          Serial.println("Restarting ESP32...");
+          SerialBT.println("Restarting ESP32...");
+          delay(1000); // Short delay before restart
+          ESP.restart();
+          break;
+        default:
+          SerialBT.println("Invalid task number! Use 1 to 6 for tasks, 7 to view all, 8 to restart.");
+          Serial.println("Invalid task number!");
+          break;
+      }
+    }
+  } else {
+    SerialBT.println("Invalid format! Use: <task_number>*<task_content>");
+    Serial.println("Invalid format! Use: <task_number>*<task_content>");
+  }
+  incomingData = ""; // Clear buffer for the next message
+}
+}
+}
+void setup() {
+// put your setup code here, to run once:
+Serial.begin(115200);
+esp_task_wdt_deinit();
+// Create tasks on Core 0
+xTaskCreatePinnedToCore(
+task1, // Task function
+"Task 1", // Name of the task
+10000, // Stack size (bytes)
+NULL, // Parameter to pass
+1, // Task priority
+&task1Handle, // Task handle
+0 // Core
+);
+delay(500);
+xTaskCreatePinnedToCore(
+task2,
+"Task 2",
+16000,
+NULL,
+1,
+&task2Handle,
+0
+);
+delay(500);
+disableCore0WDT();
+disableCore1WDT();
+}
+void task1(void *parameter) {
+esp_task_wdt_add(NULL); // Register this task with the WDT
+Serial.print("Task1 is running on core ");
+Serial.println(xPortGetCoreID());
+// SerialBT.begin("SMART_DESK");
+for (;;)
+{
+receiveBluetoothData();
+vTaskDelay(1);  // Small delay to prevent task starvation
+}
+}
+void task2(void *parameter)
+{
+esp_task_wdt_add(NULL); // Register this task with the WDT
+Serial.print("Task2 is running on core ");
+Serial.println(xPortGetCoreID());
+HMISerial.begin(115200, SERIAL_8N1, 16, 17);
+HMISerial1.begin(115200, SERIAL_8N1, 25, 26);
+pinMode(LAMP1,OUTPUT);
+pinMode(LAMP2,OUTPUT);
+digitalWrite(LAMP1,HIGH);
+digitalWrite(LAMP2,HIGH);
+pinMode(PULSE_PIN, OUTPUT);
+digitalWrite(PULSE_PIN, HIGH); // Ensure LOW at the start
+preferences.begin("tasks", false);
+// Retrieve stored tasks
+TASK1 = preferences.getString("task1", "No Task 1");
+TASK2 = preferences.getString("task2", "No Task 2");
+TASK3 = preferences.getString("task3", "No Task 3");
+TASK4 = preferences.getString("task4", "No Task 4");
+TASK5 = preferences.getString("task5", "No Task 5");
+TASK6 = preferences.getString("task6", "No Task 6");
+TASK1_1 = TASK1;
+TASK2_1 = TASK2;
+TASK3_1 = TASK3;
+TASK4_1 = TASK4;
+TASK5_1 = TASK5;
+TASK6_1 = TASK6;
+OPEN_1 = OPEN + " ";
+// Display stored tasks on Serial Monitor
+Serial.println("Stored Tasks:");
+Serial.println("TASK1: " + TASK1);
+Serial.println("TASK2: " + TASK2);
+Serial.println("TASK3: " + TASK3);
+Serial.println("TASK4: " + TASK4);
+Serial.println("TASK5: " + TASK5);
+Serial.println("TASK6: " + TASK6);
+dht.begin();
+ if (! rtc.begin()) {
+Serial.println("Couldn't find RTC");
+Serial.flush();
+ delay(10);
+ }
+delay(2000);
+HMI_Startupdate();
+delay(200);
+HMI_writeBLU(" 0");
+delay(1000);
+// randomSeed(analogRead(0)); // Initialize random generator
+for(;;)
+{
+Temp = String(TEMP, 2) + "C"+"       ";
+humd = String(HUMD, 2) + "%"+"       ";
+
+
+    HMI_PAGE_RESP(); // Process incoming HMI data
+
+    HMI_update();  // Update HMI with sensor data
+Read_data();
+
+
+// Allow other tasks to run
+vTaskDelay(1);  // Small delay to prevent task starvation
+}
+}
+void loop() {
+// put your main code here, to run repeatedly:
+} 
+
